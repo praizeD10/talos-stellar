@@ -70,9 +70,12 @@ pub enum DataKey {
 // ── Events ──────────────────────────────────────────────────────────
 //
 // Event schema (topics → data):
-//   tls_crt : (symbol, creator: Address)   → (talos_id: u32, name: String, category: String)
-//   pat_upd : (symbol, talos_id: u32)      → (creator: Address, creator_share: u32, investor_share: u32)
-//   fee_chg : (symbol,)                    → (old_bps: u32, new_bps: u32)
+//   tls_crt  : (symbol, creator: Address)   → (talos_id: u32, name: String, category: String)
+//   pat_upd  : (symbol, talos_id: u32)      → (creator: Address, creator_share: u32, investor_share: u32)
+//   kern_upd : (symbol, talos_id: u32)      → (approval_threshold: i128, gtm_budget: i128)
+//   pls_upd  : (symbol, talos_id: u32)      → (total_supply: i128, price_usd_cents: i128)
+//   tls_deact: (symbol, talos_id: u32)      → ()
+//   fee_chg  : (symbol,)                    → (old_bps: u32, new_bps: u32)
 
 fn emit_talos_created(env: &Env, talos_id: u32, creator: Address, name: String, category: String) {
     let topics = (symbol_short!("tls_crt"), creator);
@@ -94,6 +97,23 @@ fn emit_patron_updated(env: &Env, talos_id: u32, patron: &Patron) {
 fn emit_protocol_fee_changed(env: &Env, old_bps: u32, new_bps: u32) {
     let topics = (symbol_short!("fee_chg"),);
     env.events().publish(topics, (old_bps, new_bps));
+}
+
+fn emit_kernel_updated(env: &Env, talos_id: u32, kernel: &Kernel) {
+    let topics = (symbol_short!("kern_upd"), talos_id);
+    env.events()
+        .publish(topics, (kernel.approval_threshold, kernel.gtm_budget));
+}
+
+fn emit_pulse_updated(env: &Env, talos_id: u32, pulse: &Pulse) {
+    let topics = (symbol_short!("pls_upd"), talos_id);
+    env.events()
+        .publish(topics, (pulse.total_supply, pulse.price_usd_cents));
+}
+
+fn emit_talos_deactivated(env: &Env, talos_id: u32) {
+    let topics = (symbol_short!("tls_deact"), talos_id);
+    env.events().publish(topics, ());
 }
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -252,11 +272,13 @@ impl TalosRegistry {
 
         talos.creator.require_auth();
 
-        talos.kernel = kernel;
+        talos.kernel = kernel.clone();
 
         e.storage()
             .persistent()
             .set(&DataKey::Talos(talos_id), &talos);
+
+        emit_kernel_updated(&e, talos_id, &kernel);
     }
 
     /// Update pulse token config for a Talos.
@@ -269,11 +291,13 @@ impl TalosRegistry {
 
         talos.creator.require_auth();
 
-        talos.pulse = pulse;
+        talos.pulse = pulse.clone();
 
         e.storage()
             .persistent()
             .set(&DataKey::Talos(talos_id), &talos);
+
+        emit_pulse_updated(&e, talos_id, &pulse);
     }
 
     /// Deactivate a Talos.
@@ -290,6 +314,8 @@ impl TalosRegistry {
         e.storage()
             .persistent()
             .set(&DataKey::Talos(talos_id), &talos);
+
+        emit_talos_deactivated(&e, talos_id);
     }
 
     /// Initialize the contract with protocol wallet and fee.
@@ -770,5 +796,118 @@ mod tests {
             .deactivate_talos(&id);
 
         assert!(!client.is_active(&id));
+    }
+
+    #[test]
+    fn update_kernel_emits_kern_upd_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &protocol_wallet);
+
+        let new_kernel = Kernel {
+            approval_threshold: 20,
+            gtm_budget: 5_000,
+            min_patron_pulse: 500,
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_kernel",
+                    args: (id, new_kernel.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_kernel(&id, &new_kernel);
+
+        // tls_crt + kern_upd
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        let (addr, topics, data) = events.get(1).unwrap();
+
+        assert_eq!(addr, contract_id);
+        assert_eq!(topics.len(), 2);
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("kern_upd"));
+        assert_topic_u32(&env, &topics, 1, id);
+
+        let (threshold, budget): (i128, i128) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(threshold, 20);
+        assert_eq!(budget, 5_000);
+    }
+
+    #[test]
+    fn update_pulse_emits_pls_upd_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &protocol_wallet);
+
+        let new_pulse = Pulse {
+            total_supply: 2_000_000,
+            price_usd_cents: 200,
+            token_symbol: s(&env, "TLOS2"),
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_pulse",
+                    args: (id, new_pulse.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_pulse(&id, &new_pulse);
+
+        // tls_crt + pls_upd
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        let (addr, topics, data) = events.get(1).unwrap();
+
+        assert_eq!(addr, contract_id);
+        assert_eq!(topics.len(), 2);
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("pls_upd"));
+        assert_topic_u32(&env, &topics, 1, id);
+
+        let (supply, price): (i128, i128) = TryFromVal::try_from_val(&env, &data).unwrap();
+        assert_eq!(supply, 2_000_000);
+        assert_eq!(price, 200);
+    }
+
+    #[test]
+    fn deactivate_talos_emits_tls_deact_event() {
+        let (env, contract_id) = setup();
+        let client = TalosRegistryClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        let protocol_wallet = Address::generate(&env);
+        let id = create_talos_with_auth(&env, &client, &contract_id, &creator, &protocol_wallet);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "deactivate_talos",
+                    args: (id,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .deactivate_talos(&id);
+
+        // tls_crt + tls_deact
+        let events = env.events().all();
+        assert_eq!(events.len(), 2);
+        let (addr, topics, _data) = events.get(1).unwrap();
+
+        assert_eq!(addr, contract_id);
+        assert_eq!(topics.len(), 2);
+        assert_topic_symbol(&env, &topics, 0, symbol_short!("tls_deact"));
+        assert_topic_u32(&env, &topics, 1, id);
     }
 }
