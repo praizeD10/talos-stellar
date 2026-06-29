@@ -135,6 +135,71 @@ class XAdapter(BaseSocialAdapter):
 
     # ── Publishing ───────────────────────────────────────────
 
+    # Playwright selectors for X's compose UI (kept in one place so they're easy to update)
+    _COMPOSE_SELECTORS = [
+        '[data-testid="tweetTextarea_0"]',
+        '[aria-label="Post text"]',
+        'div[contenteditable="true"][role="textbox"]',
+    ]
+    _SUBMIT_SELECTORS = [
+        '[data-testid="tweetButtonInline"]',
+        '[data-testid="tweetButton"]',
+        'button[type="submit"]:has-text("Post")',
+    ]
+
+    async def _compose_via_selectors(self, content: str) -> bool:
+        """
+        Fallback: open compose dialog and post via Playwright selectors.
+        Returns True if the tweet was submitted, False otherwise.
+        """
+        pw, browser, page = await self._browser.get_playwright_page()
+        if page is None:
+            return False
+
+        try:
+            # Try clicking the compose/tweet button in the sidebar first
+            compose_btn = page.locator('[data-testid="SideNav_NewTweet_Button"]')
+            if compose_btn.count():
+                compose_btn.first.click()
+                await asyncio.sleep(2)
+
+            # Find the compose text area
+            box = None
+            for sel in self._COMPOSE_SELECTORS:
+                loc = page.locator(sel)
+                if loc.count():
+                    box = loc.first
+                    break
+
+            if box is None:
+                console.print("[yellow]X selector fallback: compose box not found.[/yellow]")
+                return False
+
+            box.click()
+            await asyncio.sleep(0.5)
+            box.type(content, delay=30)
+            await asyncio.sleep(1)
+
+            # Submit
+            for sel in self._SUBMIT_SELECTORS:
+                btn = page.locator(sel)
+                if btn.count() and btn.first.is_enabled():
+                    btn.first.click()
+                    await asyncio.sleep(4)
+                    return True
+
+            console.print("[yellow]X selector fallback: submit button not found.[/yellow]")
+            return False
+        except Exception as exc:
+            console.print(f"[yellow]X selector fallback error: {exc}[/yellow]")
+            return False
+        finally:
+            try:
+                browser.close()
+                pw.stop()
+            except Exception:
+                pass
+
     async def post(self, content: str, **kwargs) -> PublishResult:
         valid, error = self.validate_content(content)
         if not valid:
@@ -143,36 +208,56 @@ class XAdapter(BaseSocialAdapter):
         await self._ensure_login()
         await self._dismiss_cookie_banner()
 
-        # Use Playwright keyboard shortcuts directly — bypasses Stagehand LLM overhead
-        await self._browser.keyboard_press("n")
-        await asyncio.sleep(2)
-        await self._browser.keyboard_type(content)
-        await asyncio.sleep(2)
-        await self._browser.keyboard_press("Control+Enter")
-        await asyncio.sleep(4)
+        # --- Primary path: keyboard shortcut ---
+        keyboard_ok = False
+        try:
+            await self._browser.keyboard_press("n")
+            await asyncio.sleep(2)
+            await self._browser.keyboard_type(content)
+            await asyncio.sleep(1)
+            await self._browser.keyboard_press("Control+Enter")
+            await asyncio.sleep(4)
+            keyboard_ok = True
+        except Exception as exc:
+            console.print(f"[yellow]X keyboard path failed ({type(exc).__name__}: {exc}), trying selector fallback.[/yellow]")
 
-        verify = await self._browser.extract(
-            "Is there a compose tweet dialog/modal currently open on the page? "
-            "If no dialog is open and you see the timeline → dialog_open: false. "
-            "If the compose dialog is still visible with text → dialog_open: true.",
-            schema={"type": "object", "properties": {"dialog_open": {"type": "boolean"}}, "required": ["dialog_open"]},
-        )
-        dialog_open = bool(verify.get("dialog_open")) if isinstance(verify, dict) else True
-        if dialog_open:
+        # --- Check whether the dialog is still open ---
+        if keyboard_ok:
+            verify = await self._browser.extract(
+                "Is there a compose tweet dialog/modal currently open on the page? "
+                "If no dialog is open and you see the timeline → dialog_open: false. "
+                "If the compose dialog is still visible with text → dialog_open: true.",
+                schema={"type": "object", "properties": {"dialog_open": {"type": "boolean"}}, "required": ["dialog_open"]},
+            )
+            dialog_open = bool(verify.get("dialog_open")) if isinstance(verify, dict) else True
+
+            if not dialog_open:
+                return PublishResult(status="posted", channel=self.channel_name, content=content)
+
+            # Dismiss the stale dialog before trying the fallback
+            console.print("[yellow]Keyboard path: dialog still open, switching to selector fallback.[/yellow]")
             try:
                 await self._browser.act("Press the Escape key")
                 await asyncio.sleep(1)
-                await self._browser.act("Click the 'Discard' button")
+                await self._browser.act("Click the 'Discard' button if it appears")
+                await asyncio.sleep(1)
             except Exception:
                 pass
-            return PublishResult(
-                status="failed",
-                channel=self.channel_name,
-                content=content,
-                error="Post failed — compose dialog still open. Tweet was NOT published.",
-            )
 
-        return PublishResult(status="posted", channel=self.channel_name, content=content)
+        # --- Fallback path: Playwright selectors ---
+        await self._browser.goto(_HOME_URL)
+        await asyncio.sleep(2)
+
+        posted = await self._compose_via_selectors(content)
+        if posted:
+            return PublishResult(status="posted", channel=self.channel_name, content=content)
+
+        return PublishResult(
+            status="failed",
+            channel=self.channel_name,
+            content=content,
+            error="Post failed — both keyboard shortcut and selector fallback were unable to submit the tweet.",
+        )
 
     async def reply(self, target_url: str, content: str, **kwargs) -> PublishResult:
         await self._ensure_login()

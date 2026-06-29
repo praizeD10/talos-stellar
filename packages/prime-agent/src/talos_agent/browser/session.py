@@ -225,8 +225,19 @@ class BrowserSession:
                 pw.stop()
         await asyncio.to_thread(_press)
 
-    async def url(self) -> str:
-        return ""
+    async def get_playwright_page(self):
+        """Return a live Playwright Page connected over CDP, or a (None, None, None) tuple."""
+        def _connect():
+            from playwright.sync_api import sync_playwright
+            cdp_url = self._get_cdp_url()
+            if not cdp_url:
+                return None, None, None
+            pw = sync_playwright().start()
+            browser = pw.chromium.connect_over_cdp(cdp_url)
+            page = browser.contexts[0].pages[0]
+            return pw, browser, page
+
+        return await asyncio.to_thread(_connect)
 
     async def close(self) -> None:
         self._closed = True
