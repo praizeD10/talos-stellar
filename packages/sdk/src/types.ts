@@ -1,5 +1,26 @@
 // ── Request types ────────────────────────────────────────────────
 
+/**
+ * Emitted after every SDK request. Safe to forward to any telemetry backend.
+ * Path segments that could contain user IDs are replaced with `:id`.
+ */
+export interface RequestEvent {
+  /** Redacted API path, e.g. /api/talos/:id/activity */
+  path: string;
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  /** HTTP status code, or 0 if the request never reached the server. */
+  status: number;
+  /** Wall-clock time from request start to response/error, in milliseconds. */
+  durationMs: number;
+  /** Random per-request ID for correlating logs. Never contains user data. */
+  correlationId: string;
+  /** Present only when the request failed. Contains the error message. */
+  error?: string;
+}
+
+/** Hook called after every completed request. Exceptions are swallowed. */
+export type TelemetryHook = (event: RequestEvent) => void;
+
 export interface CreateTalosParams {
   name: string;
   category: string;

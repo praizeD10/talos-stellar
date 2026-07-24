@@ -23,16 +23,21 @@ import type {
   TransferParams,
   TransferResponse,
   PaginatedResponse,
+  RequestEvent,
+  TelemetryHook,
 } from "./types.js";
 
 export interface TalosClientOptions {
   baseUrl?: string;
   apiKey?: string;
+  /** Called after every completed request (success or error). Never throws. */
+  onRequest?: TelemetryHook;
 }
 
 export class TalosClient {
   private baseUrl: string;
   private headers: Record<string, string>;
+  private onRequest: TelemetryHook;
 
   constructor(options: TalosClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "https://talos-stellar.vercel.app").replace(/\/$/, "");
@@ -40,6 +45,7 @@ export class TalosClient {
     if (options.apiKey) {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
+    this.onRequest = options.onRequest ?? (() => undefined);
   }
 
   // ── Internal fetch helper ──────────────────────────────────
@@ -56,15 +62,41 @@ export class TalosClient {
       const qs = new URLSearchParams(filteredParams).toString();
       if (qs) url += `?${qs}`;
     }
-    const res = await fetch(url, {
-      ...init,
-      headers: { ...this.headers, ...init?.headers },
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new TalosAPIError(res.status, body, path);
+
+    const correlationId = Math.random().toString(36).slice(2, 10);
+    const method = (init?.method ?? "GET") as RequestEvent["method"];
+    const startedAt = Date.now();
+    let status = 0;
+    let error: string | undefined;
+
+    try {
+      const res = await fetch(url, {
+        ...init,
+        headers: { ...this.headers, ...init?.headers },
+      });
+      status = res.status;
+      if (!res.ok) {
+        const body = await res.text();
+        error = body;
+        throw new TalosAPIError(res.status, body, path);
+      }
+      return res.json() as Promise<T>;
+    } catch (err) {
+      if (!(err instanceof TalosAPIError)) {
+        error = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      const event: RequestEvent = {
+        path: _redactPath(path),
+        method,
+        status,
+        durationMs: Date.now() - startedAt,
+        correlationId,
+        error,
+      };
+      try { this.onRequest(event); } catch { /* hooks must not affect callers */ }
     }
-    return res.json() as Promise<T>;
   }
 
   // ── Talos CRUD ────────────────────────────────────────────
@@ -306,4 +338,17 @@ export class TalosAPIError extends Error {
     super(`Talos API error ${status} on ${path}: ${body}`);
     this.name = "TalosAPIError";
   }
+}
+
+/**
+ * Replace dynamic path segments (IDs, keys) with a placeholder so paths
+ * are safe to emit to telemetry without leaking user data.
+ *
+ * e.g. /api/talos/abc123/activity  →  /api/talos/:id/activity
+ */
+function _redactPath(path: string): string {
+  return path
+    .split("?")[0]                              // strip query string
+    .replace(/\/[a-zA-Z0-9_-]{16,}/g, "/:id")  // long opaque IDs
+    .replace(/\/[cC][a-zA-Z0-9]{15,}/g, "/:id"); // cuid2-style IDs
 }
