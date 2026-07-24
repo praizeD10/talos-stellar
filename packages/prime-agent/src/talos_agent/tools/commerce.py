@@ -71,11 +71,49 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
     except json.JSONDecodeError:
         payload_dict = {}
 
-    # Budget check — refuse if monthly spending would exceed GTM budget
+    # Derive a stable idempotency key for this (buyer, seller, service) triple.
+    # Using a fixed key means repeated calls for the same logical purchase are
+    # deduplicated — the agent can safely retry after a crash without re-paying.
+    import hashlib
+    job_key = hashlib.sha256(
+        f"{_settings.talos_id}:{talos_id}:{service_type}:{payload}".encode()
+    ).hexdigest()[:24]
+
+    # ── Crash-recovery: resume from whatever state we left off in ──────────
+    existing = _db.get_commerce_job(job_key)
+    if existing:
+        status = existing["status"]
+        if status in ("submitted", "completed"):
+            # Already confirmed — never resubmit
+            return {
+                "status": status,
+                "job_id": job_key,
+                "talos_id": talos_id,
+                "service_type": service_type,
+                "resumed": True,
+            }
+        if status == "signed":
+            # Payment was signed but submit crashed — reuse the stored sig
+            submit_result = await _api.submit_commerce(
+                talos_id,
+                payment_header=existing["payment_sig"],
+                payload=payload_dict,
+            )
+            if not submit_result or "error" in submit_result:
+                return {"error": "Commerce resubmission failed after crash recovery"}
+            _db.update_commerce_status(job_key, "submitted")
+            return {
+                "status": "submitted",
+                "job_id": job_key,
+                "talos_id": talos_id,
+                "service_type": service_type,
+                "resumed": True,
+            }
+
+    # ── Budget check ────────────────────────────────────────────────────────
     talos_config = _db.get_talos_config()
     gtm_budget = float((talos_config or {}).get("gtmBudget", 200))
     spent_month = _db.get_spending_period(30)
-    # We'll check against actual price after 402, but pre-check with budget headroom
     if spent_month >= gtm_budget:
         return {
             "error": "GTM budget exhausted for this month",
@@ -84,17 +122,16 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
             "suggestion": "Focus on free actions (posting, research, fulfilling jobs) or request budget increase approval",
         }
 
-    # Step 1: GET service → expect 402
+    # ── Step 1: GET service → expect 402 ───────────────────────────────────
     response = await _api.get_service(talos_id, service_type=service_type or None)
 
     if response.status_code != 402:
         return {"error": f"Expected 402, got {response.status_code}", "body": response.text[:200]}
 
-    # Parse 402 response
     payment_details = response.json()
     price = payment_details.get("price", 0)
     payee = payment_details.get("payee", "")
-    # Check if purchase would exceed GTM budget
+
     if spent_month + float(price) > gtm_budget:
         return {
             "error": f"Purchase of ${price} would exceed GTM budget",
@@ -105,7 +142,6 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
             "suggestion": "Request approval to exceed budget or wait for next period",
         }
 
-    # Check approval threshold
     threshold = float(_settings.approval_threshold)
     if price > threshold:
         result = await _api.create_approval(
@@ -122,11 +158,10 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
             "talos_id": talos_id,
         }
 
-    # Step 2: Sign payment (EIP-3009)
+    # ── Step 2: Sign payment ────────────────────────────────────────────────
     signer = _get_signer()
     await signer.initialize()
 
-    # Convert price to USDC smallest unit (6 decimals) — string-based to avoid float rounding
     amount_units = price_to_usdc_units(str(price))
 
     sign_result = await signer.sign_payment(
@@ -136,11 +171,22 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
         asset_issuer=USDC_TESTNET_ISSUER,
     )
 
-
     if "error" in sign_result:
         return sign_result
 
-    # Step 3: POST with X-PAYMENT header
+    # Durably persist the signed header BEFORE submitting.
+    # If the process crashes between here and the submit response, the next
+    # run will find status='signed' and reuse this header without re-signing.
+    _db.begin_commerce_job(
+        job_id=job_key,
+        talos_id=talos_id,
+        service_type=service_type,
+        payment_sig=sign_result["payment_header"],
+        price_usdc_units=amount_units,
+        payload=payload_dict,
+    )
+
+    # ── Step 3: Submit with X-PAYMENT header ───────────────────────────────
     submit_result = await _api.submit_commerce(
         talos_id,
         payment_header=sign_result["payment_header"],
@@ -150,28 +196,24 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
     if not submit_result:
         return {"error": "Commerce submission failed"}
 
-    # Server returns error JSON if payment verification failed
     if "error" in submit_result:
         return {"error": submit_result["error"], "details": submit_result.get("details", "")}
 
-    job_id = submit_result.get("jobId") or submit_result.get("id", "")
+    server_job_id = submit_result.get("jobId") or submit_result.get("id", job_key)
 
-    # Track in local DB
-    _db.add_commerce_job(job_id, talos_id, service_type, payload_dict)
-
-    # Record spending against GTM budget
+    # Advance state to submitted and record spending
+    _db.update_commerce_status(job_key, "submitted")
     _db.record_spending(
         amount=float(price),
         category="x402_purchase",
         description=f"Service from Talos {talos_id}: {service_type}",
     )
 
-    # Instant fulfillment: result is already in the response
     if submit_result.get("status") == "completed" and submit_result.get("result"):
-        _db.update_commerce_status(job_id, "completed")
+        _db.update_commerce_status(job_key, "completed")
         return {
             "status": "completed",
-            "job_id": job_id,
+            "job_id": server_job_id,
             "price": price,
             "talos_id": talos_id,
             "service_type": service_type,
@@ -180,7 +222,7 @@ async def purchase_service(talos_id: str, service_type: str = "", payload: str =
 
     return {
         "status": "submitted",
-        "job_id": job_id,
+        "job_id": server_job_id,
         "price": price,
         "talos_id": talos_id,
         "service_type": service_type,
