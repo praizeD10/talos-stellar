@@ -183,6 +183,13 @@ CREATE INDEX IF NOT EXISTS idx_dividends_log_status ON dividends_log(status);
 CREATE INDEX IF NOT EXISTS idx_dividends_log_recipient ON dividends_log(recipient_address);
         """,
     ),
+    (
+        6,
+        """
+ALTER TABLE commerce_queue ADD COLUMN payment_sig TEXT;
+ALTER TABLE commerce_queue ADD COLUMN price_usdc_units INTEGER;
+        """,
+    ),
 ]
 
 
@@ -324,6 +331,39 @@ class LocalDB:
         self._conn.execute(
             "INSERT OR IGNORE INTO commerce_queue (job_id, talos_id, service_type, payload) VALUES (?, ?, ?, ?)",
             (job_id, talos_id, service_type, json.dumps(payload) if payload else None),
+        )
+        self._conn.commit()
+
+    def get_commerce_job(self, job_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT job_id, talos_id, service_type, status, payment_sig, price_usdc_units "
+            "FROM commerce_queue WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def begin_commerce_job(
+        self,
+        job_id: str,
+        talos_id: str,
+        service_type: str,
+        payment_sig: str,
+        price_usdc_units: int,
+        payload: dict | None = None,
+    ) -> None:
+        """Persist a signed-but-not-yet-submitted job so restarts can resume safely."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO commerce_queue "
+            "(job_id, talos_id, service_type, payload, status, payment_sig, price_usdc_units) "
+            "VALUES (?, ?, ?, ?, 'signed', ?, ?)",
+            (
+                job_id,
+                talos_id,
+                service_type,
+                json.dumps(payload) if payload else None,
+                payment_sig,
+                price_usdc_units,
+            ),
         )
         self._conn.commit()
 
